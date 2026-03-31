@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { MOVIES } from '@consumet/extensions';
+import { makeProviders, makeStandardFetcher, targets } from '@movie-web/providers';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -8,131 +8,83 @@ const PORT = process.env.PORT || 3001;
 app.set('trust proxy', true);
 app.use(cors({ origin: '*' }));
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const TMDB_KEY = process.env.TMDB_KEY || 'cb1dc311039e6ae85db0aa200345cbc5';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// ─── MASSIVE LIST OF PUBLIC API MIRRORS ───────────────────────────────────
-const PUBLIC_MIRRORS = [
-  'https://api.consumet.org',
-  'https://consumet-api.herokuapp.com',
-  'https://c.delusionz.xyz',
-  'https://api.anify.tv',
-  'https://consumet-api-production-e544.up.railway.app',
-  'https://api.streamm.tv',
-  'https://consumet-api.onrender.com',
-  'https://consumet.vercel.app'
-];
+// ─── THE NUCLEAR ENGINE ───────────────────────────────────────────────────
+// This targets exposed mobile APK databases to completely bypass Cloudflare
+const providers = makeProviders({
+  fetcher: makeStandardFetcher(fetch),
+  target: targets.NATIVE // Tells the scrapers we are running in Node.js
+});
 
-// ─── NATIVE SCRAPERS ──────────────────────────────────────────────────────
-// Removed deprecated scrapers (ZoeChip, VidSrcTo, MovieHdWatch) that crash the latest package
-const NATIVE_PROVIDERS = [
-  { name: 'FlixHQ', client: new MOVIES.FlixHQ() },
-  { name: 'SFlix', client: new MOVIES.SFlix() },
-  { name: 'Goku', client: new MOVIES.Goku() }
-];
-
-// ─── THE SHOTGUN AGGREGATOR ENGINE ────────────────────────────────────────
 app.get('/api/stream/:type/:id', async (req, res) => {
   const { type, id } = req.params;
-  const season = parseInt(req.query.s || '1', 10);
-  const episode = parseInt(req.query.e || '1', 10);
-
-  console.log(`\n🚀 [SHOTGUN START] Fetching TMDB ${id} (${type})...`);
+  const isTv = type === 'tv';
 
   try {
-    // 1. Get exact Title & Year from TMDB for native scrapers
-    const tmdbUrl = type === 'movie'
-      ? `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`
-      : `https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}`;
+    console.log(`\n🚀 [APK BYPASS] Fetching TMDB ${id}...`);
 
+    // 1. Get flawless metadata from TMDB
+    const tmdbUrl = isTv
+      ? `https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}`
+      : `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`;
+      
     const tmdbRes = await fetch(tmdbUrl);
     if (!tmdbRes.ok) throw new Error('Failed to fetch TMDB metadata');
     const tmdbData = await tmdbRes.json();
 
-    const title = type === 'movie' ? tmdbData.title : tmdbData.name;
-    const year = type === 'movie' ? tmdbData.release_date?.split('-')[0] : tmdbData.first_air_date?.split('-')[0];
+    // 2. Format the media object exactly how the engine demands it
+    const media = {
+      type: isTv ? 'show' : 'movie',
+      title: isTv ? tmdbData.name : tmdbData.title,
+      releaseYear: isTv
+        ? parseInt(tmdbData.first_air_date?.split('-')[0] || 0)
+        : parseInt(tmdbData.release_date?.split('-')[0] || 0),
+      tmdbId: id.toString(),
+    };
 
-    // 2. Build the massive array of racing promises
-    const racingTasks = [];
+    if (isTv) {
+      media.episode = { number: parseInt(req.query.e || 1), tmdbId: '' };
+      media.season = { number: parseInt(req.query.s || 1), tmdbId: '' };
+    }
 
-    // --- STRATEGY A: Query all Public Mirrors simultaneously ---
-    PUBLIC_MIRRORS.forEach(baseUrl => {
-      racingTasks.push(new Promise(async (resolve, reject) => {
-        try {
-          const infoUrl = `${baseUrl}/meta/tmdb/info/${id}?type=${type}`;
-          const infoRes = await fetch(infoUrl, { signal: AbortSignal.timeout(8000) });
-          if (!infoRes.ok) throw new Error('Info failed');
-          const info = await infoRes.json();
+    console.log(`[Engine] Searching mobile databases for: ${media.title} (${media.releaseYear})`);
 
-          let watchId = info.episodeId || info.id;
-          if (type === 'tv' && info.episodes) {
-            const ep = info.episodes.find(e => e.season === season && e.number === episode);
-            if (ep) watchId = ep.id;
-          }
+    // 3. FIRE THE ENGINE: It automatically searches 20+ unlocked databases
+    const result = await providers.runAll({ media });
 
-          const watchUrl = `${baseUrl}/meta/tmdb/watch/${watchId}?id=${id}`;
-          const watchRes = await fetch(watchUrl, { signal: AbortSignal.timeout(8000) });
-          if (!watchRes.ok) throw new Error('Watch failed');
-          const watch = await watchRes.json();
+    if (!result || !result.stream) {
+      return res.status(404).json({ ok: false, error: 'No raw streams found across any unlocked database.' });
+    }
 
-          if (!watch.sources || watch.sources.length === 0) throw new Error('No sources');
-          
-          const best = watch.sources.find(s => s.quality === 'auto') || watch.sources[0];
-          resolve({ m3u8: best.url, source: `Mirror API (${baseUrl})` });
-        } catch (e) {
-          reject(e); // Reject silently so Promise.any keeps searching
-        }
-      }));
+    // 4. Extract the raw m3u8 or mp4 link
+    let rawM3u8 = '';
+    if (result.stream.type === 'hls') {
+      rawM3u8 = result.stream.playlist;
+    } else if (result.stream.type === 'file') {
+      // If it's a raw mp4, grab the highest quality available
+      const qualities = Object.values(result.stream.qualities);
+      rawM3u8 = qualities[0]?.url;
+    }
+
+    if (!rawM3u8) throw new Error('Failed to parse stream URL from engine output.');
+
+    console.log(`✅ [SUCCESS] -> Found raw stream via ${result.providerId}`);
+
+    // 5. Proxy the winning stream to bypass browser CORS constraints
+    const proxied = `/api/proxy?url=${encodeURIComponent(rawM3u8)}`;
+
+    return res.json({ 
+      ok: true, 
+      m3u8: proxied, 
+      source: `App Database (${result.providerId})`, 
+      raw: rawM3u8 
     });
 
-    // --- STRATEGY B: Run all Native Scrapers simultaneously ---
-    NATIVE_PROVIDERS.forEach(provider => {
-      racingTasks.push(new Promise(async (resolve, reject) => {
-        try {
-          const search = await provider.client.search(title);
-          if (!search.results || search.results.length === 0) throw new Error('No search results');
-
-          let match = search.results.find(r => r.releaseDate === year || r.year === year) || search.results[0];
-          
-          const info = await provider.client.fetchMediaInfo(match.id);
-          if (!info) throw new Error('No media info');
-
-          let watchId = info.id;
-          if (type === 'tv' && info.episodes) {
-            const ep = info.episodes.find(e => e.season === season && e.number === episode);
-            if (!ep) throw new Error('Episode not found');
-            watchId = ep.id;
-          } else if (info.episodes && info.episodes.length > 0) {
-            watchId = info.episodes[0].id;
-          }
-
-          const sources = await provider.client.fetchEpisodeSources(watchId, info.id);
-          if (!sources || !sources.sources || sources.sources.length === 0) throw new Error('No sources');
-
-          const best = sources.sources.find(s => s.quality === 'auto') || sources.sources[0];
-          resolve({ m3u8: best.url, source: `Native Scraper (${provider.name})` });
-        } catch (e) {
-          reject(e); // Reject silently so Promise.any keeps searching
-        }
-      }));
-    });
-
-    // 3. FIRE THE SHOTGUN: The first Promise to resolve wins
-    const winner = await Promise.any(racingTasks);
-
-    console.log(`✅ [SHOTGUN WINNER] -> Found stream via ${winner.source}`);
-    
-    // 4. Proxy the winning stream to bypass browser CORS constraints
-    const proxied = `/api/proxy?url=${encodeURIComponent(winner.m3u8)}`;
-    
-    return res.json({ ok: true, m3u8: proxied, source: winner.source, raw: winner.m3u8 });
-
-  } catch (aggregateError) {
-    console.error('❌ [SHOTGUN FAILED] Every single provider and mirror was blocked or offline.');
-    res.status(502).json({ 
-      ok: false, 
-      error: 'Aggregator failed. All sources and mirrors are currently offline or actively blocking Render\'s datacenter IPs.' 
-    });
+  } catch (e) {
+    console.error(`❌ [FAILED]`, e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -195,5 +147,4 @@ function toAbs(url, base) {
 }
 
 app.get('/health', (_, res) => res.json({ ok: true }));
-
 app.listen(PORT, () => console.log(`apex-stream-api running on :${PORT}`));
