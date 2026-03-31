@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { META } from '@consumet/extensions';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -9,38 +10,20 @@ app.use(cors({ origin: '*' }));
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// ─── CONSUMET API INTEGRATION ─────────────────────────────────────────────
-// Executed server-side to completely bypass the browser's CORS blocks
-const CONSUMET_INSTANCES = [
-  'https://api.consumet.org',
-  'https://consumet-api.herokuapp.com'
-];
+// Initialize the TMDB provider natively on your server
+const tmdb = new META.TMDB();
 
-async function fetchFromConsumet(endpoint) {
-  for (const baseUrl of CONSUMET_INSTANCES) {
-    try {
-      const res = await fetch(`${baseUrl}${endpoint}`, {
-        headers: { 'User-Agent': UA },
-        signal: AbortSignal.timeout(10000)
-      });
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.warn(`[Consumet] Failed on ${baseUrl}: ${e.message}`);
-    }
-  }
-  throw new Error('All Consumet streaming instances failed or are offline.');
-}
-
+// ─── STREAM FETCHER ────────────────────────────────────────────────────────
 app.get('/api/stream/:type/:id', async (req, res) => {
   const { type, id } = req.params;
   const season = parseInt(req.query.s || '1', 10);
   const episode = parseInt(req.query.e || '1', 10);
 
   try {
-    console.log(`[Consumet] Fetching ${type} ${id}...`);
+    console.log(`[Consumet Native] Fetching ${type} ${id}...`);
     
-    // 1. Get Media Info
-    const infoData = await fetchFromConsumet(`/meta/tmdb/info/${id}?type=${type}`);
+    // 1. Get Media Info directly via Consumet NPM package
+    const infoData = await tmdb.fetchMediaInfo(id, type);
     if (!infoData || (!infoData.id && !infoData.episodeId)) {
       return res.status(404).json({ ok: false, error: 'Media not found on streaming servers' });
     }
@@ -52,8 +35,8 @@ app.get('/api/stream/:type/:id', async (req, res) => {
       if (ep) watchId = ep.id;
     }
 
-    // 3. Get Streaming Links
-    const watchData = await fetchFromConsumet(`/meta/tmdb/watch/${watchId}?id=${id}`);
+    // 3. Extract Streaming Links locally
+    const watchData = await tmdb.fetchEpisodeSources(watchId, infoData.id);
     if (!watchData.sources || watchData.sources.length === 0) {
       return res.status(404).json({ ok: false, error: 'No playable sources found' });
     }
@@ -62,10 +45,10 @@ app.get('/api/stream/:type/:id', async (req, res) => {
     const bestSource = watchData.sources.find(s => s.quality === 'auto') || watchData.sources[0];
     const rawM3u8 = bestSource.url;
 
-    // 5. Proxy the m3u8 so the frontend doesn't crash on video chunks
+    // 5. Proxy the m3u8 so your frontend doesn't crash on CORS blocks
     const proxied = `/api/proxy?url=${encodeURIComponent(rawM3u8)}`;
 
-    res.json({ ok: true, m3u8: proxied, source: 'Consumet API', raw: rawM3u8 });
+    res.json({ ok: true, m3u8: proxied, source: 'Consumet Native', raw: rawM3u8 });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
@@ -73,7 +56,6 @@ app.get('/api/stream/:type/:id', async (req, res) => {
 });
 
 // ─── PROXY FOR VIDEO CHUNKS ───────────────────────────────────────────────
-// Forces hls.js to download chunks through Render, bypassing stream protections
 app.get('/api/proxy', async (req, res) => {
   const raw = req.query.url;
   if (!raw) return res.status(400).send('missing url');
@@ -119,6 +101,7 @@ app.get('/api/proxy', async (req, res) => {
   }
 });
 
+// ─── MANIFEST REWRITER ────────────────────────────────────────────────────────
 function rewriteManifest(text, base, req) {
   const proxyBase = `${req.protocol}://${req.get('host')}/api/proxy?url=`;
   return text.split('\n').map(line => {
@@ -142,4 +125,5 @@ function toAbs(url, base) {
 }
 
 app.get('/health', (_, res) => res.json({ ok: true }));
+
 app.listen(PORT, () => console.log(`apex-stream-api running on :${PORT}`));
