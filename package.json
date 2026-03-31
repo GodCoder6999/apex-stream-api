@@ -1,7 +1,7 @@
 {
   "name": "apex-stream-api",
   "version": "1.0.0",
-  "description": "Backend API for proxying video streams",
+  "description": "Backend API for proxying video streams via APK bypass",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,9 +9,8 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "@consumet/extensions": "^1.5.0",
+    "@movie-web/providers": "^1.4.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "undici": "^6.19.2"
+    "express": "^4.19.2"
   }
 }
