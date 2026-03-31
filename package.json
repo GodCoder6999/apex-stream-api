@@ -1,7 +1,7 @@
 {
   "name": "apex-stream-api",
   "version": "1.0.0",
-  "description": "Backend API for proxying video streams via APK bypass",
+  "description": "CinePro Architecture Multi-Scraper Backend",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,7 +9,6 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "@movie-web/providers": "^2.4.13",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   }
