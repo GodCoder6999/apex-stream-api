@@ -9,7 +9,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "@movie-web/providers": "^1.4.2",
+    "@movie-web/providers": "^2.4.13",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   }
