@@ -1,12 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // apex-stream-api  — Express backend deployed on Render (free tier)
-//
-// Two jobs:
-//  1. /api/stream/:type/:id   →  scrape embed pages, return a proxied m3u8 URL
-//  2. /api/proxy              →  CORS proxy for all m3u8 + ts segment requests
-//
-// Deploy this to Render.com (free web service, Node 18+).
-// Your Vite/Vercel frontend calls this backend.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express from 'express'
@@ -16,6 +9,9 @@ import fetch   from 'node-fetch'
 const app  = express()
 const PORT = process.env.PORT || 3001
 
+// FIX: Trust Render's load balancer so req.protocol returns 'https'
+app.set('trust proxy', true)
+
 // Allow requests from any origin (your Vercel frontend)
 app.use(cors({ origin: '*' }))
 
@@ -23,8 +19,6 @@ app.use(cors({ origin: '*' }))
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 // ─── EMBED SOURCES ───────────────────────────────────────────────────────────
-// These pages embed a player that loads a raw .m3u8.
-// We fetch the page HTML server-side and extract the URL.
 const SOURCES = [
   {
     id: 'vidsrc-cc',
@@ -71,10 +65,6 @@ const SOURCES = [
 ]
 
 // ─── EXTRACT M3U8 FROM AN EMBED PAGE ─────────────────────────────────────────
-// The embed page HTML always contains the m3u8 URL in a JS variable or
-// data attribute. We fetch the page and regex-extract it.
-// If the first-level page has an <iframe>, we follow it one level deep.
-
 const M3U8_RE = [
   /["'`](https?:\/\/[^"'`\s]+\.m3u8[^"'`\s]*)/g,
   /file\s*:\s*["'`]([^"'`]+\.m3u8[^"'`]*)/g,
@@ -100,12 +90,10 @@ function extractM3u8FromHtml(html) {
       hits.push(u)
     }
   }
-  // Longer URLs are usually the actual CDN stream (not an ad placeholder)
   hits.sort((a, b) => b.length - a.length)
   return hits[0] || null
 }
 
-// Extract iframes from HTML, return absolute src URLs
 function extractIframeSrcs(html, pageUrl) {
   const srcs = []
   const re = /<iframe[^>]+src=["']([^"']+)/gi
@@ -138,7 +126,6 @@ async function fetchHtml(url, referer) {
 async function resolveSource(source, type, id, season = 1, episode = 1) {
   const embedUrl = type === 'tv' ? source.tv(id, season, episode) : source.movie(id)
 
-  // --- Level 1: fetch embed page ---
   let html
   try {
     html = await fetchHtml(embedUrl, 'https://www.google.com/')
@@ -146,11 +133,9 @@ async function resolveSource(source, type, id, season = 1, episode = 1) {
     throw new Error(`page fetch failed: ${e.message}`)
   }
 
-  // Try to find m3u8 directly in the embed page
   let m3u8 = extractM3u8FromHtml(html)
   if (m3u8) return { m3u8, source: source.label }
 
-  // --- Level 2: follow iframes ---
   const iframes = extractIframeSrcs(html, embedUrl)
   for (const iframeSrc of iframes.slice(0, 4)) {
     try {
@@ -158,7 +143,6 @@ async function resolveSource(source, type, id, season = 1, episode = 1) {
       m3u8 = extractM3u8FromHtml(iframeHtml)
       if (m3u8) return { m3u8, source: source.label }
 
-      // Level 3: iframes inside iframes (some providers nest 2 deep)
       const nested = extractIframeSrcs(iframeHtml, iframeSrc)
       for (const nestedSrc of nested.slice(0, 3)) {
         try {
@@ -174,7 +158,6 @@ async function resolveSource(source, type, id, season = 1, episode = 1) {
 }
 
 // ─── /api/stream/:type/:id ────────────────────────────────────────────────────
-// Returns: { m3u8: "/api/proxy?url=...", source: "VidSrc CC" }
 app.get('/api/stream/:type/:id', async (req, res) => {
   const { type, id } = req.params
   const season  = parseInt(req.query.s  || '1', 10)
@@ -183,7 +166,6 @@ app.get('/api/stream/:type/:id', async (req, res) => {
   for (const source of SOURCES) {
     try {
       const result = await resolveSource(source, type, id, season, episode)
-      // Wrap through our proxy so the browser never hits CDN directly
       const proxied = `/api/proxy?url=${encodeURIComponent(result.m3u8)}`
       console.log(`[${source.label}] ✓ ${id} → ${result.m3u8.substring(0, 80)}…`)
       return res.json({ ok: true, m3u8: proxied, source: result.source, raw: result.m3u8 })
@@ -196,7 +178,6 @@ app.get('/api/stream/:type/:id', async (req, res) => {
 })
 
 // ─── /api/proxy ───────────────────────────────────────────────────────────────
-// Proxies m3u8 manifests (rewriting internal URLs) and binary .ts segments.
 app.get('/api/proxy', async (req, res) => {
   const raw = req.query.url
   if (!raw) return res.status(400).send('missing url')
@@ -236,7 +217,6 @@ app.get('/api/proxy', async (req, res) => {
     return res.send(rewritten)
   }
 
-  // Binary segment
   const buf = Buffer.from(await upstream.arrayBuffer())
   res.setHeader('Content-Type', ct || 'video/mp2t')
   return res.send(buf)
