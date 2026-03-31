@@ -4,12 +4,12 @@
 
 import express from 'express'
 import cors    from 'cors'
-import fetch   from 'node-fetch'
+// ❌ REMOVED: node-fetch. Node 18+ has a native, much better fetch built-in!
 
 const app  = express()
 const PORT = process.env.PORT || 3001
 
-// FIX: Trust Render's load balancer so req.protocol returns 'https'
+// FIX: Trust Render's load balancer so proxied streams use secure https://
 app.set('trust proxy', true)
 
 // Allow requests from any origin (your Vercel frontend)
@@ -182,7 +182,11 @@ app.get('/api/proxy', async (req, res) => {
   const raw = req.query.url
   if (!raw) return res.status(400).send('missing url')
 
-  const target = decodeURIComponent(raw)
+  let target = raw
+  try {
+    target = decodeURIComponent(raw)
+  } catch(e) {}
+
   let origin
   try { origin = new URL(target).origin } catch { origin = 'https://vidsrc.me' }
 
@@ -204,7 +208,8 @@ app.get('/api/proxy', async (req, res) => {
   if (!upstream.ok) return res.status(upstream.status).send(`upstream ${upstream.status}`)
 
   const ct = upstream.headers.get('content-type') || ''
-  const isM3u8 = ct.includes('mpegurl') || target.includes('.m3u8')
+  // FIX: Make the content-type check case-insensitive so it doesn't break on 'mpegURL'
+  const isM3u8 = ct.toLowerCase().includes('mpegurl') || target.includes('.m3u8')
 
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Cache-Control', 'no-store')
@@ -217,6 +222,7 @@ app.get('/api/proxy', async (req, res) => {
     return res.send(rewritten)
   }
 
+  // Binary .ts video segment
   const buf = Buffer.from(await upstream.arrayBuffer())
   res.setHeader('Content-Type', ct || 'video/mp2t')
   return res.send(buf)
