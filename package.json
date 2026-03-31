@@ -1,16 +1,15 @@
 {
-  "name": "cinepro-enterprise-backend",
-  "version": "2.0.0",
+  "name": "cinepro-free-tier",
+  "version": "1.0.0",
+  "description": "CinePro Architecture - Single Container",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "start:gateway": "node gateway.js",
-    "start:worker": "node worker.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "bullmq": "^5.7.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "ioredis": "^5.4.1",
     "jsonwebtoken": "^9.0.2"
   }
 }
