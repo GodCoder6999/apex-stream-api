@@ -14,7 +14,9 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // ─── THE NUCLEAR ENGINE ───────────────────────────────────────────────────
 const providers = makeProviders({
   fetcher: makeStandardFetcher(fetch),
-  target: targets.NATIVE 
+  // FIX: Changed from NATIVE to ANY. 
+  // NATIVE filtered out 95% of the databases. ANY runs all 20+ scrapers.
+  target: targets.ANY 
 });
 
 app.get('/api/stream/:type/:id', async (req, res) => {
@@ -24,8 +26,6 @@ app.get('/api/stream/:type/:id', async (req, res) => {
   try {
     console.log(`\n🚀 [APK BYPASS] Fetching Metadata for ${id}...`);
 
-    // FIX: Added 'append_to_response=external_ids' to grab the IMDB ID.
-    // Without the IMDB ID, 80% of the scraping databases will fail to search.
     const tmdbUrl = isTv
       ? `https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`
       : `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`;
@@ -34,7 +34,6 @@ app.get('/api/stream/:type/:id', async (req, res) => {
     if (!tmdbRes.ok) throw new Error('Failed to fetch TMDB metadata');
     const tmdbData = await tmdbRes.json();
 
-    // Safely extract the IMDB ID
     const extractedImdbId = tmdbData.external_ids?.imdb_id || tmdbData.imdb_id || '';
 
     const media = {
@@ -44,7 +43,7 @@ app.get('/api/stream/:type/:id', async (req, res) => {
         ? parseInt(tmdbData.first_air_date?.split('-')[0] || 0)
         : parseInt(tmdbData.release_date?.split('-')[0] || 0),
       tmdbId: id.toString(),
-      imdbId: extractedImdbId, // THIS WAS THE MISSING KEY
+      imdbId: extractedImdbId,
     };
 
     if (isTv) {
@@ -52,32 +51,51 @@ app.get('/api/stream/:type/:id', async (req, res) => {
       media.season = { number: parseInt(req.query.s || 1), tmdbId: '' };
     }
 
-    console.log(`[Engine] Searching databases for: ${media.title} (${media.releaseYear}) | IMDB: ${media.imdbId}`);
+    console.log(`[Engine] Searching ALL databases for: ${media.title} (${media.releaseYear}) | IMDB: ${media.imdbId}`);
 
+    // Run all 20+ scrapers
     const result = await providers.runAll({ media });
 
-    if (!result || !result.stream) {
-      return res.status(404).json({ ok: false, error: 'No raw streams found across any unlocked database.' });
-    }
-
     let rawM3u8 = '';
-    if (result.stream.type === 'hls') {
-      rawM3u8 = result.stream.playlist;
-    } else if (result.stream.type === 'file') {
-      const qualities = Object.values(result.stream.qualities);
-      rawM3u8 = qualities[0]?.url;
+    let sourceName = '';
+
+    if (result && result.stream) {
+      if (result.stream.type === 'hls') {
+        rawM3u8 = result.stream.playlist;
+      } else if (result.stream.type === 'file') {
+        const qualities = Object.values(result.stream.qualities);
+        rawM3u8 = qualities[0]?.url;
+      }
+      sourceName = `App Database (${result.providerId})`;
+    } 
+    
+    // LAYER 2 FALLBACK: If movie-web somehow fails, use a secondary unblocked community API
+    if (!rawM3u8) {
+        console.log(`⚠️ Engine yielded no results. Triggering Layer 2 Community Fallback...`);
+        const fallbackRes = await fetch(`https://api.streamm.tv/meta/tmdb/watch/${id}?id=${id}`);
+        if (fallbackRes.ok) {
+            const fallbackData = await fallbackRes.json();
+            const bestSource = fallbackData.sources?.find(s => s.quality === 'auto') || fallbackData.sources?.[0];
+            if (bestSource) {
+                rawM3u8 = bestSource.url;
+                sourceName = 'StreammTV Fallback';
+            }
+        }
     }
 
-    if (!rawM3u8) throw new Error('Failed to parse stream URL from engine output.');
+    if (!rawM3u8) {
+        throw new Error('Failed to extract raw stream from all primary and fallback databases.');
+    }
 
-    console.log(`✅ [SUCCESS] -> Found raw stream via ${result.providerId}`);
+    console.log(`✅ [SUCCESS] -> Found raw stream via ${sourceName}`);
 
+    // Proxy the stream to bypass browser CORS blocks
     const proxied = `/api/proxy?url=${encodeURIComponent(rawM3u8)}`;
 
     return res.json({ 
       ok: true, 
       m3u8: proxied, 
-      source: `App Database (${result.providerId})`, 
+      source: sourceName, 
       raw: rawM3u8 
     });
 
