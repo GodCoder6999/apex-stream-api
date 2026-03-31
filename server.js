@@ -12,7 +12,6 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const TMDB_KEY = process.env.TMDB_KEY || 'cb1dc311039e6ae85db0aa200345cbc5';
 
 // ─── MASSIVE LIST OF PUBLIC API MIRRORS ───────────────────────────────────
-// These are community-hosted Consumet APIs. If the main one is down, others usually work.
 const PUBLIC_MIRRORS = [
   'https://api.consumet.org',
   'https://consumet-api.herokuapp.com',
@@ -25,13 +24,11 @@ const PUBLIC_MIRRORS = [
 ];
 
 // ─── NATIVE SCRAPERS ──────────────────────────────────────────────────────
+// Removed deprecated scrapers (ZoeChip, VidSrcTo, MovieHdWatch) that crash the latest package
 const NATIVE_PROVIDERS = [
   { name: 'FlixHQ', client: new MOVIES.FlixHQ() },
   { name: 'SFlix', client: new MOVIES.SFlix() },
-  { name: 'Goku', client: new MOVIES.Goku() },
-  { name: 'ZoeChip', client: new MOVIES.ZoeChip() },
-  { name: 'VidSrcTo', client: new MOVIES.VidSrcTo() },
-  { name: 'MovieHdWatch', client: new MOVIES.MovieHdWatch() }
+  { name: 'Goku', client: new MOVIES.Goku() }
 ];
 
 // ─── THE SHOTGUN AGGREGATOR ENGINE ────────────────────────────────────────
@@ -58,7 +55,7 @@ app.get('/api/stream/:type/:id', async (req, res) => {
     // 2. Build the massive array of racing promises
     const racingTasks = [];
 
-    // --- STRATEGY A: Query all 8+ Public Mirrors simultaneously ---
+    // --- STRATEGY A: Query all Public Mirrors simultaneously ---
     PUBLIC_MIRRORS.forEach(baseUrl => {
       racingTasks.push(new Promise(async (resolve, reject) => {
         try {
@@ -83,12 +80,12 @@ app.get('/api/stream/:type/:id', async (req, res) => {
           const best = watch.sources.find(s => s.quality === 'auto') || watch.sources[0];
           resolve({ m3u8: best.url, source: `Mirror API (${baseUrl})` });
         } catch (e) {
-          reject(e); // Reject silently so Promise.any keeps searching other providers
+          reject(e); // Reject silently so Promise.any keeps searching
         }
       }));
     });
 
-    // --- STRATEGY B: Run all 6+ Native Scrapers simultaneously ---
+    // --- STRATEGY B: Run all Native Scrapers simultaneously ---
     NATIVE_PROVIDERS.forEach(provider => {
       racingTasks.push(new Promise(async (resolve, reject) => {
         try {
@@ -115,13 +112,12 @@ app.get('/api/stream/:type/:id', async (req, res) => {
           const best = sources.sources.find(s => s.quality === 'auto') || sources.sources[0];
           resolve({ m3u8: best.url, source: `Native Scraper (${provider.name})` });
         } catch (e) {
-          reject(e); // Reject silently so Promise.any keeps searching other providers
+          reject(e); // Reject silently so Promise.any keeps searching
         }
       }));
     });
 
-    // 3. FIRE THE SHOTGUN: The first Promise to resolve (find an m3u8) wins.
-    // If every single one of the 14+ tasks fails, it falls into the catch block.
+    // 3. FIRE THE SHOTGUN: The first Promise to resolve wins
     const winner = await Promise.any(racingTasks);
 
     console.log(`✅ [SHOTGUN WINNER] -> Found stream via ${winner.source}`);
@@ -132,16 +128,15 @@ app.get('/api/stream/:type/:id', async (req, res) => {
     return res.json({ ok: true, m3u8: proxied, source: winner.source, raw: winner.m3u8 });
 
   } catch (aggregateError) {
-    // This only triggers if literally 100% of the racing promises failed
     console.error('❌ [SHOTGUN FAILED] Every single provider and mirror was blocked or offline.');
     res.status(502).json({ 
       ok: false, 
-      error: 'Aggregator failed. All 25+ sources and mirrors are currently offline or actively blocking Render\'s datacenter IPs.' 
+      error: 'Aggregator failed. All sources and mirrors are currently offline or actively blocking Render\'s datacenter IPs.' 
     });
   }
 });
 
-// ─── PROXY FOR VIDEO CHUNKS (Unchanged) ───────────────────────────────────
+// ─── PROXY FOR VIDEO CHUNKS ───────────────────────────────────────────────
 app.get('/api/proxy', async (req, res) => {
   const raw = req.query.url;
   if (!raw) return res.status(400).send('missing url');
