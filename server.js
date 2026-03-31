@@ -22,15 +22,20 @@ app.get('/api/stream/:type/:id', async (req, res) => {
   const isTv = type === 'tv';
 
   try {
-    console.log(`\n🚀 [APK BYPASS] Fetching TMDB ${id}...`);
+    console.log(`\n🚀 [APK BYPASS] Fetching Metadata for ${id}...`);
 
+    // FIX: Added 'append_to_response=external_ids' to grab the IMDB ID.
+    // Without the IMDB ID, 80% of the scraping databases will fail to search.
     const tmdbUrl = isTv
-      ? `https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}`
-      : `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`;
+      ? `https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`
+      : `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`;
       
     const tmdbRes = await fetch(tmdbUrl);
     if (!tmdbRes.ok) throw new Error('Failed to fetch TMDB metadata');
     const tmdbData = await tmdbRes.json();
+
+    // Safely extract the IMDB ID
+    const extractedImdbId = tmdbData.external_ids?.imdb_id || tmdbData.imdb_id || '';
 
     const media = {
       type: isTv ? 'show' : 'movie',
@@ -39,6 +44,7 @@ app.get('/api/stream/:type/:id', async (req, res) => {
         ? parseInt(tmdbData.first_air_date?.split('-')[0] || 0)
         : parseInt(tmdbData.release_date?.split('-')[0] || 0),
       tmdbId: id.toString(),
+      imdbId: extractedImdbId, // THIS WAS THE MISSING KEY
     };
 
     if (isTv) {
@@ -46,7 +52,7 @@ app.get('/api/stream/:type/:id', async (req, res) => {
       media.season = { number: parseInt(req.query.s || 1), tmdbId: '' };
     }
 
-    console.log(`[Engine] Searching mobile databases for: ${media.title} (${media.releaseYear})`);
+    console.log(`[Engine] Searching databases for: ${media.title} (${media.releaseYear}) | IMDB: ${media.imdbId}`);
 
     const result = await providers.runAll({ media });
 
