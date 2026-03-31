@@ -9,6 +9,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@consumet/extensions": "^1.5.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "undici": "^6.19.2"
