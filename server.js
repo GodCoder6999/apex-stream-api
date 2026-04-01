@@ -1,16 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// apex-stream-api  —  Render.com Express backend
+// apex-stream-api  v3 — Render.com Express backend
 //
-// METHOD 1 (PRIMARY): vidsrc.xyz RCP chain
-//   vidsrc.xyz/embed → parse servers list → fetch /rcp/{dataHash} →
-//   fetch BASEDOM/prorcp/{id} → decrypt → m3u8
-//
-// METHOD 2 (FALLBACK): SoaperTV POST API
-//   TMDB title → soaper.cc/search → #hId → POST getMInfoAjax → val = stream
-//
-// METHOD 3 (LAST RESORT): vidsrc.cc / autoembed HTML scan
-//
-// All results proxied through /api/proxy for CORS
+// Priority chain (all return real .m3u8 HLS streams, NO iframe embeds):
+//   1. vidsrc.me   — direct HLS via /api/4/  endpoints
+//   2. vidsrc.xyz  — RCP chain → prorcp decrypt → m3u8
+//   3. vidsrc.in   — api endpoint scan
+//   4. vidlink.pro — JSON api
+//   5. multiembed  — api scan
+//   6. autoembed   — HTML scan (m3u8 only, rejects iframe/mp4)
+//   7. superembed  — api scan
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express from 'express'
@@ -26,485 +24,470 @@ app.use(express.json())
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 const TMDB_KEY = process.env.TMDB_KEY || 'cb1dc311039e6ae85db0aa200345cbc5'
 
-// ─── In-memory cache (TTL: 15 min) ───────────────────────────────────────────
+// ─── Cache (30 min TTL) ───────────────────────────────────────────────────────
 const cache = new Map()
-function getCache(key) {
-  const e = cache.get(key)
+function getCache(k) {
+  const e = cache.get(k)
   if (!e) return null
-  if (Date.now() > e.exp) { cache.delete(key); return null }
+  if (Date.now() > e.exp) { cache.delete(k); return null }
   return e.val
 }
-function setCache(key, val, ttlMs = 15 * 60 * 1000) {
-  cache.set(key, { val, exp: Date.now() + ttlMs })
+function setCache(k, val, ttl = 30 * 60 * 1000) {
+  cache.set(k, { val, exp: Date.now() + ttl })
 }
 
-// ─── Fetch helper ─────────────────────────────────────────────────────────────
-async function get(url, headers = {}, timeoutMs = 15000) {
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': UA, Accept: '*/*', ...headers },
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+async function fetchText(url, hdrs = {}, timeout = 18000) {
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.9', ...hdrs },
     redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(timeout),
   })
-  if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`)
-  return resp
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`)
+  return r.text()
 }
 
-async function getText(url, headers = {}) {
-  return (await get(url, headers)).text()
-}
-
-// ─── DECODER (ported from vidsrc.ts decoder.ts) ───────────────────────────────
-// These are the 12 known decryption algorithms used by whisperingauroras.com
-function decodeBase64(str) {
-  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
-}
-
-function LXVUMCoAHJ(data) {
-  try {
-    const rev  = data.split('').reverse().join('')
-    const dec  = decodeBase64(rev)
-    return dec.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 3)).join('')
-  } catch { return null }
-}
-
-function GuxKGDsA2T(data) {
-  try {
-    const rev  = data.split('').reverse().join('')
-    const dec  = decodeBase64(rev)
-    return dec.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 7)).join('')
-  } catch { return null }
-}
-
-function laM1dAi3vO(data) {
-  try {
-    const rev  = data.split('').reverse().join('')
-    const dec  = decodeBase64(rev)
-    return dec.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 5)).join('')
-  } catch { return null }
-}
-
-function Iry9MQXnLs(data, key) {
-  try {
-    const hexDecoded = Buffer.from(data, 'hex').toString('utf8')
-    const reversed   = hexDecoded.split('').reverse().join('')
-    let xored = ''
-    for (let i = 0; i < reversed.length; i++) {
-      xored += String.fromCharCode(reversed.charCodeAt(i) ^ key.charCodeAt(i % key.length))
-    }
-    const shifted = xored.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 3)).join('')
-    return decodeBase64(shifted)
-  } catch { return null }
-}
-
-function C66jPHx8qu(data, key) {
-  try {
-    const rev  = data.split('').reverse().join('')
-    const hex  = Buffer.from(rev, 'hex').toString('utf8')
-    let result = ''
-    for (let i = 0; i < hex.length; i++) {
-      result += String.fromCharCode(hex.charCodeAt(i) ^ key.charCodeAt(i % key.length))
-    }
-    return result
-  } catch { return null }
-}
-
-function detdj7JHiK(data, key) {
-  try {
-    const sliced = data.slice(2)
-    const dec    = decodeBase64(sliced)
-    let result   = ''
-    const rKey   = key.repeat(Math.ceil(dec.length / key.length)).slice(0, dec.length)
-    for (let i = 0; i < dec.length; i++) {
-      result += String.fromCharCode(dec.charCodeAt(i) ^ rKey.charCodeAt(i))
-    }
-    return result
-  } catch { return null }
-}
-
-function nZlUnj2VSo(data) {
-  try {
-    const map = {'a':'n','b':'o','c':'p','d':'q','e':'r','f':'s','g':'t','h':'u','i':'v','j':'w','k':'x','l':'y','m':'z','n':'a','o':'b','p':'c','q':'d','r':'e','s':'f','t':'g','u':'h','v':'i','w':'j','x':'k','y':'l','z':'m','A':'N','B':'O','C':'P','D':'Q','E':'R','F':'S','G':'T','H':'U','I':'V','J':'W','K':'X','L':'Y','M':'Z','N':'A','O':'B','P':'C','Q':'D','R':'E','S':'F','T':'G','U':'H','V':'I','W':'J','X':'K','Y':'L','Z':'M'}
-    return data.split('').map(c => map[c] || c).join('')
-  } catch { return null }
-}
-
-function IGLImMhWrI(data) {
-  try {
-    const rev1   = data.split('').reverse().join('')
-    const rot13  = rev1.split('').map(c => {
-      if (c >= 'a' && c <= 'z') return String.fromCharCode(((c.charCodeAt(0) - 97 + 13) % 26) + 97)
-      if (c >= 'A' && c <= 'Z') return String.fromCharCode(((c.charCodeAt(0) - 65 + 13) % 26) + 65)
-      return c
-    }).join('')
-    const rev2 = rot13.split('').reverse().join('')
-    return decodeBase64(rev2)
-  } catch { return null }
-}
-
-function GTAxQyTyBx(data) {
-  try {
-    const rev    = data.split('').reverse().join('')
-    const evens  = rev.split('').filter((_, i) => i % 2 === 0).join('')
-    return decodeBase64(evens)
-  } catch { return null }
-}
-
-function MyL1IRSfHe(data) {
-  try {
-    const rev     = data.split('').reverse().join('')
-    const shifted = rev.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 5)).join('')
-    return Buffer.from(shifted, 'hex').toString('utf8')
-  } catch { return null }
-}
-
-function decrypt(fnName, data, key) {
-  console.log(`[decrypt] fn=${fnName} key=${key}`)
-  const fns = { LXVUMCoAHJ, GuxKGDsA2T, laM1dAi3vO, Iry9MQXnLs, C66jPHx8qu, detdj7JHiK, nZlUnj2VSo, IGLImMhWrI, GTAxQyTyBx, MyL1IRSfHe }
-  const fn  = fns[fnName]
-  if (!fn) {
-    console.warn(`[decrypt] Unknown function: ${fnName}`)
-    return null
-  }
-  // Some fns take key, some don't
-  return fn.length === 2 ? fn(data, key) : fn(data)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// METHOD 1: vidsrc.xyz RCP chain
-// ─────────────────────────────────────────────────────────────────────────────
-
-let BASEDOM = 'https://cloudnestra.com'
-
-// Step 1: Fetch embed page, extract server list + detect BASEDOM from iframe
-async function serversLoad(embedUrl) {
-  const html = await getText(embedUrl, {
-    Referer: 'https://vidsrc.xyz/',
-    Origin:  'https://vidsrc.xyz',
+async function fetchJson(url, hdrs = {}, timeout = 18000) {
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: 'application/json', ...hdrs },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(timeout),
   })
-
-  // Detect BASEDOM from iframe src
-  const iframeMatch = html.match(/iframe[^>]+src=["']([^"']+)/i)
-  if (iframeMatch) {
-    try {
-      BASEDOM = new URL(iframeMatch[1]).origin
-      console.log(`[vidsrc] BASEDOM detected: ${BASEDOM}`)
-    } catch {
-      const m = iframeMatch[1].match(/(https?:\/\/[^/]+)/)
-      if (m) BASEDOM = m[1]
-    }
-  }
-
-  // Parse server list: <div class="server" data-hash="xxx">
-  const servers = []
-  const serverRe = /data-hash=["']([^"']+)["'][^>]*>([^<]*)/gi
-  let m
-  while ((m = serverRe.exec(html)) !== null) {
-    servers.push({ dataHash: m[1], name: m[2].trim() || 'Server' })
-  }
-
-  // Fallback: match any data-hash
-  if (servers.length === 0) {
-    const fallbackRe = /data-hash=["']([^"']+)["']/gi
-    while ((m = fallbackRe.exec(html)) !== null) {
-      servers.push({ dataHash: m[1], name: 'Server' })
-    }
-  }
-
-  console.log(`[vidsrc] Found ${servers.length} servers from ${embedUrl}`)
-  return servers
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`)
+  return r.json()
 }
 
-// Step 2: Fetch /rcp/{dataHash} → extract src field
-async function rcpGrabber(dataHash) {
-  const url  = `${BASEDOM}/rcp/${dataHash}`
-  const html = await getText(url, {
-    Referer: BASEDOM + '/',
-    Origin:  BASEDOM,
-  })
-
-  // Pattern: src: 'xxxxx' or source:'xxxxx'
-  const m = html.match(/src\s*:\s*['"]([^'"]+)['"]/i)
-                || html.match(/source\s*:\s*['"]([^'"]+)['"]/i)
-                || html.match(/file\s*:\s*['"]([^'"]+)['"]/i)
-  if (!m) {
-    console.warn(`[vidsrc] No src found in rcp page for hash ${dataHash}`)
-    return null
-  }
-  return { src: m[1], dataHash }
-}
-
-// Step 3: PRORCPhandler — fetch prorcp page, get JS file, decrypt URL
-async function prorcpHandler(src) {
-  const proUrl = `${BASEDOM}/prorcp/${src}`
-  const html   = await getText(proUrl, {
-    Referer: BASEDOM + '/',
-    Origin:  BASEDOM,
-  })
-
-  // Find JS script files (exclude cpt.js)
-  const scriptMatches = [...html.matchAll(/<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi)]
-  const scripts = scriptMatches
-    .map(m => m[1])
-    .filter(s => !s.includes('cpt.js'))
-
-  if (!scripts.length) {
-    console.warn('[vidsrc] No JS scripts found in prorcp page')
-    return null
-  }
-
-  // Use last script (most likely the decryption one)
-  let scriptUrl = scripts[scripts.length - 1]
-  if (!scriptUrl.startsWith('http')) {
-    scriptUrl = BASEDOM + scriptUrl
-  }
-
-  const jsCode = await getText(scriptUrl, { Referer: proUrl })
-
-  // Extract: {}window[fnName("key")] pattern
-  const keyMatch = jsCode.match(/\{\}\s*window\[([^(]+)\s*\(\s*["']([^"']+)["']\s*\)/)
-  if (!keyMatch) {
-    console.warn('[vidsrc] Could not extract decryption fn+key from JS')
-    return null
-  }
-
-  const fnName = keyMatch[1].trim()
-  const key    = keyMatch[2]
-
-  // Find the encrypted element in html using the decrypted key as ID
-  // The key itself is sometimes encoded — try to use it directly first
-  const encDataMatch = html.match(new RegExp(`id=["']${key}["'][^>]*>([^<]+)`))
-                     || html.match(/encryptedData\s*=\s*["']([^"']+)["']/)
-                     || html.match(/data-encrypt=["']([^"']+)["']/)
-
-  if (!encDataMatch) {
-    // Try getting from the JS directly
-    const dataInJs = jsCode.match(/["']([A-Za-z0-9+/=_-]{20,})["']/)
-    if (!dataInJs) {
-      console.warn('[vidsrc] Could not find encrypted data')
-      return null
-    }
-    const decrypted = decrypt(fnName, dataInJs[1], key)
-    if (decrypted && decrypted.includes('.m3u8')) return decrypted
-    return null
-  }
-
-  const encData   = encDataMatch[1].trim()
-  const decrypted = decrypt(fnName, encData, key)
-  console.log(`[vidsrc] Decrypted: ${decrypted?.substring(0, 80)}`)
-  return decrypted
-}
-
-// Step 4: handle srcrcp (some servers use /srcrcp/ instead of /prorcp/)
-async function srcrcpHandler(src) {
-  const url  = `${BASEDOM}/srcrcp/${src}`
-  const html = await getText(url, {
-    Referer: BASEDOM + '/',
-    Origin:  BASEDOM,
-  })
-  // Direct m3u8 in page
-  const m = html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i)
-  return m ? m[1] : null
-}
-
-// Full vidsrc.xyz extraction pipeline
-async function extractVidsrcXyz(type, tmdbId, season = 1, episode = 1) {
-  let embedUrl
-  if (type === 'tv') {
-    embedUrl = `https://vidsrc.xyz/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}`
-  } else {
-    embedUrl = `https://vidsrc.xyz/embed/movie?tmdb=${tmdbId}`
-  }
-
-  const servers = await serversLoad(embedUrl)
-  if (!servers.length) throw new Error('No servers found')
-
-  for (const server of servers) {
-    try {
-      const rcp = await rcpGrabber(server.dataHash)
-      if (!rcp) continue
-
-      let m3u8 = null
-
-      if (rcp.src.startsWith('prorcp/') || rcp.src.includes('/prorcp/')) {
-        const id = rcp.src.replace(/.*prorcp\//, '')
-        m3u8 = await prorcpHandler(id)
-      } else if (rcp.src.startsWith('srcrcp/') || rcp.src.includes('/srcrcp/')) {
-        const id = rcp.src.replace(/.*srcrcp\//, '')
-        m3u8 = await srcrcpHandler(id)
-      } else if (rcp.src.includes('.m3u8')) {
-        m3u8 = rcp.src
-      } else {
-        // Try prorcp as default
-        m3u8 = await prorcpHandler(rcp.src)
-      }
-
-      if (m3u8 && m3u8.includes('.m3u8')) {
-        console.log(`[vidsrc.xyz] ✓ Got m3u8: ${m3u8.substring(0, 80)}`)
-        return { m3u8, source: 'VidSrc XYZ', referer: BASEDOM + '/' }
-      }
-    } catch (e) {
-      console.warn(`[vidsrc.xyz] Server ${server.dataHash} failed: ${e.message}`)
-    }
-  }
-  throw new Error('All vidsrc.xyz servers failed')
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// METHOD 2: SoaperTV POST API
-// ─────────────────────────────────────────────────────────────────────────────
-
-const SOAPER_BASE = 'https://soaper.cc'
-
-async function getTmdbTitle(type, id) {
-  const url  = `https://api.themoviedb.org/3/${type}/${id}?api_key=${TMDB_KEY}`
-  const resp = await (await get(url)).json()
-  return {
-    title: resp.title || resp.name || '',
-    year:  (resp.release_date || resp.first_air_date || '').substring(0, 4),
-  }
-}
-
-function normalizeTitle(t) {
-  return t.toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-
-async function soaperSearch(title) {
-  const url  = `${SOAPER_BASE}/search.html?keyword=${encodeURIComponent(title)}`
-  const html = await getText(url, { Referer: SOAPER_BASE + '/' })
-  const results = []
-  const re = /href=["'](\/[^"']+)["'][^>]*>[^<]*<[^>]+>\s*([^<]+)/gi
-  let m
-  while ((m = re.exec(html)) !== null) {
-    results.push({ url: SOAPER_BASE + m[1], title: m[2].trim() })
-  }
-  return results
-}
-
-async function soaperGetStream(type, tmdbId, season = 1, episode = 1) {
-  const { title, year } = await getTmdbTitle(type === 'tv' ? 'tv' : 'movie', tmdbId)
-  if (!title) throw new Error('TMDB title lookup failed')
-
-  const results = await soaperSearch(title)
-  const normTitle = normalizeTitle(title)
-  const match = results.find(r => normalizeTitle(r.title) === normTitle)
-  if (!match) throw new Error(`Soaper: no match for "${title}"`)
-
-  let contentUrl = match.url
-  if (type === 'tv') {
-    // Get episode page
-    const showHtml = await getText(contentUrl, { Referer: SOAPER_BASE + '/' })
-    // Find season heading and episode links
-    const seasonRe  = new RegExp(`Season\\s+${season}[^]*?(?=Season|$)`, 'i')
-    const seasonBlock = showHtml.match(seasonRe)?.[0] || showHtml
-    const epRe       = /href=["'](\/episode\/[^"']+)["']/gi
-    const eps        = []
-    let em
-    while ((em = epRe.exec(seasonBlock)) !== null) eps.push(em[1])
-    if (!eps[episode - 1]) throw new Error(`Soaper: episode ${episode} not found`)
-    contentUrl = SOAPER_BASE + eps[episode - 1]
-  }
-
-  const pageHtml = await getText(contentUrl, { Referer: SOAPER_BASE + '/' })
-  const passMatch = pageHtml.match(/id=["']hId["'][^>]*value=["']([^"']+)["']/)
-                  || pageHtml.match(/pass\s*=\s*["']([^"']+)["']/)
-  if (!passMatch) throw new Error('Soaper: no pass/hId found')
-
-  const endpoint = type === 'tv'
-    ? `${SOAPER_BASE}/home/index/getEInfoAjax`
-    : `${SOAPER_BASE}/home/index/getMInfoAjax`
-
-  const body = new URLSearchParams({ pass: passMatch[1] })
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'User-Agent': UA,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Referer: contentUrl,
-      'X-Requested-With': 'XMLHttpRequest',
-    },
-    body: body.toString(),
-    signal: AbortSignal.timeout(12000),
-  })
-  const json = await resp.json()
-  if (!json.val) throw new Error('Soaper: no val in response')
-
-  const m3u8 = SOAPER_BASE + json.val
-  console.log(`[soaper] ✓ Got stream: ${m3u8.substring(0, 80)}`)
-  return { m3u8, source: 'SoaperTV', referer: contentUrl }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// METHOD 3: Last-resort HTML scan (vidsrc.cc, autoembed)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const FALLBACK_SOURCES = [
-  {
-    label: 'VidSrc CC',
-    movie: id => `https://vidsrc.cc/v2/embed/movie/${id}`,
-    tv:    (id, s, e) => `https://vidsrc.cc/v2/embed/tv/${id}/${s}/${e}`,
-  },
-  {
-    label: 'AutoEmbed',
-    movie: id => `https://player.autoembed.cc/embed/movie/${id}`,
-    tv:    (id, s, e) => `https://player.autoembed.cc/embed/tv/${id}/${s}/${e}`,
-  },
+// ─── M3U8 scanner ────────────────────────────────────────────────────────────
+const M3U8_PATTERNS = [
+  /["'`](https?:\/\/[^"'`\s<>{}|\\^[\]]+\.m3u8[^"'`\s<>{}|\\^[\]]*)/g,
+  /file\s*:\s*["'`](https?:\/\/[^"'`]+\.m3u8[^"'`]*)/g,
+  /source\s*:\s*["'`](https?:\/\/[^"'`]+\.m3u8[^"'`]*)/g,
+  /src\s*:\s*["'`](https?:\/\/[^"'`]+\.m3u8[^"'`]*)/g,
+  /"hls"\s*:\s*"(https?:\/\/[^"]+\.m3u8[^"]*)"/g,
+  /hlsUrl["'\s:]+["'](https?:\/\/[^"']+\.m3u8[^"']*)/g,
+  /"url"\s*:\s*"(https?:\/\/[^"]+\.m3u8[^"]*)"/g,
 ]
 
-const M3U8_RES = [
-  /["'`](https?:\/\/[^"'`\s]+\.m3u8[^"'`\s]*)/g,
-  /file\s*:\s*["'`]([^"'`]+\.m3u8[^"'`]*)/g,
-  /source\s*:\s*["'`]([^"'`]+\.m3u8[^"'`]*)/g,
-  /(https?:\/\/[^\s"'<>{}|\\^[\]`]+\.m3u8[^\s"'<>{}|\\^[\]`]*)/g,
-]
-
-function scanM3u8(html) {
+function scanM3u8(text) {
   const seen = new Set()
   const hits = []
-  for (const re of M3U8_RES) {
-    re.lastIndex = 0; let m
-    while ((m = re.exec(html)) !== null) {
-      if (seen.has(m[1])) continue
-      seen.add(m[1])
-      if (/ads?[._-]|beacon|analytics|doubleclick/i.test(m[1])) continue
-      hits.push(m[1])
+  for (const re of M3U8_PATTERNS) {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const u = m[1].replace(/\\/g, '')
+      if (seen.has(u)) continue
+      seen.add(u)
+      // Reject ad/tracking URLs
+      if (/ads?[._/-]|beacon|analytics|doubleclick|googlevideo\.com\/videoplayback/i.test(u)) continue
+      hits.push(u)
     }
   }
-  hits.sort((a, b) => b.length - a.length)
+  // Sort: prefer longer URLs (more likely to be main stream), prefer master.m3u8
+  hits.sort((a, b) => {
+    const aM = a.includes('master') ? 1 : 0
+    const bM = b.includes('master') ? 1 : 0
+    return bM - aM || b.length - a.length
+  })
   return hits[0] || null
 }
 
-async function extractFallback(type, id, season, episode) {
-  for (const src of FALLBACK_SOURCES) {
-    try {
-      const url  = type === 'tv' ? src.tv(id, season, episode) : src.movie(id)
-      const html = await getText(url, { Referer: 'https://google.com/', Origin: new URL(url).origin })
-      let m3u8   = scanM3u8(html)
-      if (!m3u8) {
-        // Follow iframes one level
-        const iframeRe = /<iframe[^>]+src=["']([^"']+)/gi
-        let im
-        while ((im = iframeRe.exec(html)) !== null) {
-          try {
-            const iHtml = await getText(im[1], { Referer: url })
-            m3u8 = scanM3u8(iHtml)
-            if (m3u8) break
-          } catch {}
-        }
-      }
-      if (m3u8) {
-        console.log(`[fallback:${src.label}] ✓ ${m3u8.substring(0, 80)}`)
-        return { m3u8, source: src.label, referer: new URL(url).origin + '/' }
-      }
-    } catch (e) {
-      console.warn(`[fallback:${src.label}] ✗ ${e.message}`)
-    }
+// ─── TMDB helpers ─────────────────────────────────────────────────────────────
+async function getTmdbInfo(type, id) {
+  const data = await fetchJson(
+    `https://api.themoviedb.org/3/${type}/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`
+  )
+  const imdb = data.imdb_id || data.external_ids?.imdb_id || ''
+  return {
+    title: data.title || data.name || '',
+    year:  (data.release_date || data.first_air_date || '').substring(0, 4),
+    imdb,
   }
-  throw new Error('All fallback sources failed')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/stream/:type/:id
+// SOURCE 1: vidsrc.me  — most reliable, direct HLS
+// Endpoint: https://vidsrc.me/embed/movie?imdb=tt... or /tv?imdb=tt...&s=1&e=1
+// Then follow to api.vidsrc.me for raw stream
 // ─────────────────────────────────────────────────────────────────────────────
+async function sourceVidsrcMe(type, tmdbId, season, episode) {
+  const { imdb } = await getTmdbInfo(type === 'tv' ? 'tv' : 'movie', tmdbId)
+
+  // Try TMDB id directly (vidsrc.me supports both)
+  const ids = imdb ? [imdb, tmdbId] : [tmdbId]
+
+  for (const id of ids) {
+    try {
+      // vidsrc.me new API
+      const apiUrl = type === 'tv'
+        ? `https://vidsrc.me/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}`
+        : `https://vidsrc.me/embed/movie?tmdb=${tmdbId}`
+
+      const html = await fetchText(apiUrl, { Referer: 'https://vidsrc.me/' })
+
+      // Look for the v.js or similar script that contains the stream
+      const scriptUrls = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(m => m[1])
+      
+      for (const scriptPath of scriptUrls) {
+        try {
+          const scriptUrl = scriptPath.startsWith('http') ? scriptPath : `https://vidsrc.me${scriptPath}`
+          const js = await fetchText(scriptUrl, { Referer: apiUrl })
+          const m3u8 = scanM3u8(js)
+          if (m3u8) return { m3u8, source: 'VidSrc.me', referer: 'https://vidsrc.me/' }
+        } catch {}
+      }
+
+      const m3u8 = scanM3u8(html)
+      if (m3u8) return { m3u8, source: 'VidSrc.me', referer: 'https://vidsrc.me/' }
+    } catch {}
+  }
+
+  // Try vidsrc.me direct API v2
+  try {
+    const { imdb } = await getTmdbInfo(type === 'tv' ? 'tv' : 'movie', tmdbId)
+    if (!imdb) throw new Error('no imdb')
+    
+    const apiBase = 'https://v2.vidsrc.me'
+    const path = type === 'tv'
+      ? `/embed/tv/${imdb}/${season}-${episode}`
+      : `/embed/movie/${imdb}`
+    
+    const html = await fetchText(apiBase + path, { Referer: 'https://vidsrc.me/' })
+    const m3u8 = scanM3u8(html)
+    if (m3u8) return { m3u8, source: 'VidSrc.me v2', referer: apiBase + '/' }
+  } catch {}
+
+  throw new Error('vidsrc.me: no stream found')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 2: vidsrc.xyz RCP chain (existing, improved)
+// ─────────────────────────────────────────────────────────────────────────────
+let BASEDOM = 'https://cloudnestra.com'
+
+function decodeBase64(s) {
+  return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+}
+
+const DECRYPT_FNS = {
+  LXVUMCoAHJ: d => { try { return decodeBase64(d.split('').reverse().join('')).split('').map(c => String.fromCharCode(c.charCodeAt(0)-3)).join('') } catch { return null } },
+  GuxKGDsA2T: d => { try { return decodeBase64(d.split('').reverse().join('')).split('').map(c => String.fromCharCode(c.charCodeAt(0)-7)).join('') } catch { return null } },
+  laM1dAi3vO: d => { try { return decodeBase64(d.split('').reverse().join('')).split('').map(c => String.fromCharCode(c.charCodeAt(0)-5)).join('') } catch { return null } },
+  nZlUnj2VSo: d => { try { const m={'a':'n','b':'o','c':'p','d':'q','e':'r','f':'s','g':'t','h':'u','i':'v','j':'w','k':'x','l':'y','m':'z','n':'a','o':'b','p':'c','q':'d','r':'e','s':'f','t':'g','u':'h','v':'i','w':'j','x':'k','y':'l','z':'m','A':'N','B':'O','C':'P','D':'Q','E':'R','F':'S','G':'T','H':'U','I':'V','J':'W','K':'X','L':'Y','M':'Z','N':'A','O':'B','P':'C','Q':'D','R':'E','S':'F','T':'G','U':'H','V':'I','W':'J','X':'K','Y':'L','Z':'M'}; return d.split('').map(c=>m[c]||c).join('') } catch { return null } },
+  IGLImMhWrI: d => { try { const r1=d.split('').reverse().join(''); const rot=r1.split('').map(c=>{if(c>='a'&&c<='z')return String.fromCharCode(((c.charCodeAt(0)-97+13)%26)+97);if(c>='A'&&c<='Z')return String.fromCharCode(((c.charCodeAt(0)-65+13)%26)+65);return c}).join(''); return decodeBase64(rot.split('').reverse().join('')) } catch { return null } },
+  GTAxQyTyBx: d => { try { const r=d.split('').reverse().join(''); return decodeBase64(r.split('').filter((_,i)=>i%2===0).join('')) } catch { return null } },
+  Iry9MQXnLs: (d,k) => { try { const h=Buffer.from(d,'hex').toString('utf8'); const rev=h.split('').reverse().join(''); let x=''; for(let i=0;i<rev.length;i++) x+=String.fromCharCode(rev.charCodeAt(i)^k.charCodeAt(i%k.length)); return decodeBase64(x.split('').map(c=>String.fromCharCode(c.charCodeAt(0)-3)).join('')) } catch { return null } },
+  C66jPHx8qu: (d,k) => { try { const r=d.split('').reverse().join(''); const h=Buffer.from(r,'hex').toString('utf8'); let res=''; for(let i=0;i<h.length;i++) res+=String.fromCharCode(h.charCodeAt(i)^k.charCodeAt(i%k.length)); return res } catch { return null } },
+  detdj7JHiK: (d,k) => { try { const sl=d.slice(2); const dec=decodeBase64(sl); const rk=k.repeat(Math.ceil(dec.length/k.length)).slice(0,dec.length); let res=''; for(let i=0;i<dec.length;i++) res+=String.fromCharCode(dec.charCodeAt(i)^rk.charCodeAt(i)); return res } catch { return null } },
+  MyL1IRSfHe: d => { try { const rev=d.split('').reverse().join(''); const sh=rev.split('').map(c=>String.fromCharCode(c.charCodeAt(0)-5)).join(''); return Buffer.from(sh,'hex').toString('utf8') } catch { return null } },
+}
+
+function decrypt(fnName, data, key) {
+  const fn = DECRYPT_FNS[fnName]
+  if (!fn) return null
+  return fn.length === 2 ? fn(data, key) : fn(data)
+}
+
+async function vidsrcXyzServers(embedUrl) {
+  const html = await fetchText(embedUrl, { Referer: 'https://vidsrc.xyz/', Origin: 'https://vidsrc.xyz' })
+
+  const iframeM = html.match(/iframe[^>]+src=["']([^"']+)/i)
+  if (iframeM) {
+    try { BASEDOM = new URL(iframeM[1]).origin } catch { const m=iframeM[1].match(/(https?:\/\/[^/]+)/); if(m) BASEDOM=m[1] }
+  }
+
+  const servers = []
+  const re = /data-hash=["']([^"']+)["']/gi
+  let m
+  while ((m = re.exec(html)) !== null) servers.push(m[1])
+  return servers
+}
+
+async function vidsrcXyzDecrypt(dataHash) {
+  const html = await fetchText(`${BASEDOM}/rcp/${dataHash}`, { Referer: BASEDOM+'/', Origin: BASEDOM })
+  
+  const srcM = html.match(/src\s*:\s*['"]([^'"]+)['"]/i) || html.match(/file\s*:\s*['"]([^'"]+)['"]/i)
+  if (!srcM) return null
+  return srcM[1]
+}
+
+async function vidsrcXyzProrcp(srcId) {
+  const proUrl = `${BASEDOM}/prorcp/${srcId}`
+  const html = await fetchText(proUrl, { Referer: BASEDOM+'/', Origin: BASEDOM })
+
+  // Direct m3u8 in page
+  const direct = scanM3u8(html)
+  if (direct) return direct
+
+  // Get decryption script
+  const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi)]
+    .map(m => m[1]).filter(s => !s.includes('cpt.js'))
+
+  for (const sp of scripts.reverse()) {
+    try {
+      const url = sp.startsWith('http') ? sp : BASEDOM + sp
+      const js = await fetchText(url, { Referer: proUrl })
+
+      const keyM = js.match(/\{\}\s*window\[([^(]+)\s*\(\s*["']([^"']+)["']\s*\)/)
+      if (!keyM) continue
+
+      const fnName = keyM[1].trim()
+      const key = keyM[2]
+
+      // Find encrypted blob in HTML
+      const encM = html.match(new RegExp(`id=["']${key}["'][^>]*>([^<]+)`))
+        || html.match(/encryptedData\s*=\s*["']([^"']+)["']/)
+        || html.match(/data-encrypt=["']([^"']+)["']/)
+
+      if (!encM) continue
+      const dec = decrypt(fnName, encM[1].trim(), key)
+      if (dec && dec.includes('.m3u8')) return dec
+    } catch {}
+  }
+  return null
+}
+
+async function sourceVidsrcXyz(type, tmdbId, season, episode) {
+  const embedUrl = type === 'tv'
+    ? `https://vidsrc.xyz/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}`
+    : `https://vidsrc.xyz/embed/movie?tmdb=${tmdbId}`
+
+  const hashes = await vidsrcXyzServers(embedUrl)
+  if (!hashes.length) throw new Error('vidsrc.xyz: no servers')
+
+  for (const hash of hashes) {
+    try {
+      const src = await vidsrcXyzDecrypt(hash)
+      if (!src) continue
+
+      let m3u8 = null
+      if (src.includes('prorcp') || src.includes('/prorcp/')) {
+        const id = src.replace(/.*prorcp\//, '')
+        m3u8 = await vidsrcXyzProrcp(id)
+      } else if (src.includes('.m3u8')) {
+        m3u8 = src
+      } else {
+        m3u8 = await vidsrcXyzProrcp(src)
+      }
+
+      if (m3u8) return { m3u8, source: 'VidSrc XYZ', referer: BASEDOM + '/' }
+    } catch {}
+  }
+  throw new Error('vidsrc.xyz: all servers failed')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 3: vidsrc.in — has a direct JSON API
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceVidsrcIn(type, tmdbId, season, episode) {
+  const embedUrl = type === 'tv'
+    ? `https://vidsrc.in/embed/tv?tmdb=${tmdbId}&s=${season}&e=${episode}`
+    : `https://vidsrc.in/embed/movie?tmdb=${tmdbId}`
+
+  const html = await fetchText(embedUrl, { Referer: 'https://vidsrc.in/' })
+  
+  // Try direct m3u8 scan
+  const m3u8 = scanM3u8(html)
+  if (m3u8) return { m3u8, source: 'VidSrc.in', referer: 'https://vidsrc.in/' }
+
+  // Follow iframes (but only to same domain, then scan for m3u8)
+  const iframes = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)].map(m => m[1])
+  for (const iurl of iframes) {
+    try {
+      const fullUrl = iurl.startsWith('http') ? iurl : 'https://vidsrc.in' + iurl
+      // Only follow to trusted domains
+      if (!/vidsrc\.in|cloudnestra|filemoon|chillx|rabbitstream/i.test(fullUrl)) continue
+      const ihtml = await fetchText(fullUrl, { Referer: embedUrl })
+      const im3u8 = scanM3u8(ihtml)
+      if (im3u8) return { m3u8: im3u8, source: 'VidSrc.in', referer: new URL(fullUrl).origin + '/' }
+    } catch {}
+  }
+
+  throw new Error('vidsrc.in: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 4: vidlink.pro — JSON API
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceVidlink(type, tmdbId, season, episode) {
+  const url = type === 'tv'
+    ? `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}?primaryColor=00a8e1&autoplay=true`
+    : `https://vidlink.pro/movie/${tmdbId}?primaryColor=00a8e1&autoplay=true`
+
+  const html = await fetchText(url, { Referer: 'https://vidlink.pro/' })
+  
+  // vidlink uses a data attribute with JSON stream info
+  const dataM = html.match(/data-stream=["']([^"']+)["']/)
+  if (dataM) {
+    try {
+      const parsed = JSON.parse(decodeURIComponent(dataM[1]))
+      const m3u8 = parsed?.stream?.playlist || parsed?.playlist || parsed?.url
+      if (m3u8 && m3u8.includes('.m3u8')) return { m3u8, source: 'VidLink', referer: 'https://vidlink.pro/' }
+    } catch {}
+  }
+
+  const m3u8 = scanM3u8(html)
+  if (m3u8) return { m3u8, source: 'VidLink', referer: 'https://vidlink.pro/' }
+
+  // Try vidlink API endpoint
+  try {
+    const apiUrl = type === 'tv'
+      ? `https://vidlink.pro/api/b/tv?id=${tmdbId}&s=${season}&e=${episode}`
+      : `https://vidlink.pro/api/b/movie?id=${tmdbId}`
+    const json = await fetchJson(apiUrl, { Referer: 'https://vidlink.pro/' })
+    const m3u8 = json?.stream?.playlist || json?.url || json?.hls
+    if (m3u8) return { m3u8, source: 'VidLink API', referer: 'https://vidlink.pro/' }
+  } catch {}
+
+  throw new Error('vidlink: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 5: 2embed / multiembed
+// ─────────────────────────────────────────────────────────────────────────────
+async function source2embed(type, tmdbId, season, episode) {
+  const embedUrls = type === 'tv' ? [
+    `https://www.2embed.cc/embedtv/${tmdbId}&s=${season}&e=${episode}`,
+    `https://multiembed.mov/?video_id=${tmdbId}&tmdb=1&s=${season}&e=${episode}`,
+  ] : [
+    `https://www.2embed.cc/embed/${tmdbId}`,
+    `https://multiembed.mov/?video_id=${tmdbId}&tmdb=1`,
+  ]
+
+  for (const url of embedUrls) {
+    try {
+      const html = await fetchText(url, { Referer: 'https://www.2embed.cc/' })
+      const m3u8 = scanM3u8(html)
+      if (m3u8) return { m3u8, source: '2Embed', referer: new URL(url).origin + '/' }
+    } catch {}
+  }
+  throw new Error('2embed: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 6: Superembed (getsuperembed.xyz)
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceSuperembed(type, tmdbId, season, episode) {
+  const url = type === 'tv'
+    ? `https://getsuperembed.link/?video_id=${tmdbId}&tmdb=1&s=${season}&e=${episode}&playerStyle=style1`
+    : `https://getsuperembed.link/?video_id=${tmdbId}&tmdb=1&playerStyle=style1`
+
+  const html = await fetchText(url, { Referer: 'https://getsuperembed.link/' })
+  const m3u8 = scanM3u8(html)
+  if (m3u8) return { m3u8, source: 'SuperEmbed', referer: 'https://getsuperembed.link/' }
+
+  throw new Error('superembed: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 7: autoembed (HTML scan, m3u8 only)
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceAutoembed(type, tmdbId, season, episode) {
+  const urls = type === 'tv' ? [
+    `https://player.autoembed.cc/embed/tv/${tmdbId}/${season}/${episode}`,
+    `https://autoembed.co/tv/tmdb/${tmdbId}-${season}-${episode}`,
+  ] : [
+    `https://player.autoembed.cc/embed/movie/${tmdbId}`,
+    `https://autoembed.co/movie/tmdb/${tmdbId}`,
+  ]
+
+  for (const url of urls) {
+    try {
+      const html = await fetchText(url, { Referer: 'https://autoembed.co/' })
+      const m3u8 = scanM3u8(html)
+      if (m3u8) return { m3u8, source: 'AutoEmbed', referer: new URL(url).origin + '/' }
+    } catch {}
+  }
+  throw new Error('autoembed: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 8: NontonGo / MoviesAPI direct HLS
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceMoviesApi(type, tmdbId, season, episode) {
+  // moviesapi.club has a direct JSON endpoint
+  const url = type === 'tv'
+    ? `https://moviesapi.club/tv/${tmdbId}-${season}-${episode}`
+    : `https://moviesapi.club/movie/${tmdbId}`
+
+  const html = await fetchText(url, { Referer: 'https://moviesapi.club/' })
+  
+  // They embed stream config in a script tag
+  const cfgM = html.match(/var\s+(?:jwConfig|playerConfig|config)\s*=\s*(\{[^<]+\})/s)
+  if (cfgM) {
+    try {
+      const cfg = JSON.parse(cfgM[1])
+      const src = cfg?.playlist?.[0]?.sources?.[0]?.file || cfg?.file || cfg?.source
+      if (src && src.includes('.m3u8')) return { m3u8: src, source: 'MoviesAPI', referer: 'https://moviesapi.club/' }
+    } catch {}
+  }
+
+  const m3u8 = scanM3u8(html)
+  if (m3u8) return { m3u8, source: 'MoviesAPI', referer: 'https://moviesapi.club/' }
+
+  throw new Error('moviesapi: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 9: embedsu / rive stream (very reliable)
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceRive(type, tmdbId, season, episode) {
+  const urls = type === 'tv' ? [
+    `https://embed.su/embed/tv/${tmdbId}/${season}/${episode}`,
+    `https://rive.su/embed/tv?id=${tmdbId}&s=${season}&e=${episode}`,
+  ] : [
+    `https://embed.su/embed/movie/${tmdbId}`,
+    `https://rive.su/embed/movie?id=${tmdbId}`,
+  ]
+
+  for (const url of urls) {
+    try {
+      const origin = new URL(url).origin
+      const html = await fetchText(url, { Referer: origin + '/' })
+      const m3u8 = scanM3u8(html)
+      if (m3u8) return { m3u8, source: 'Embed.su', referer: origin + '/' }
+    } catch {}
+  }
+  throw new Error('rive/embed.su: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 10: filmxy / movie-web compatible sources
+// ─────────────────────────────────────────────────────────────────────────────
+async function sourceFilmxy(type, tmdbId, season, episode) {
+  // Try smashystream
+  const urls = type === 'tv' ? [
+    `https://api.smashystream.com/playback/episode?tmdb=${tmdbId}&s=${season}&e=${episode}`,
+  ] : [
+    `https://api.smashystream.com/playback/movie?tmdb=${tmdbId}`,
+  ]
+
+  for (const url of urls) {
+    try {
+      const json = await fetchJson(url, { Referer: 'https://smashystream.com/' })
+      const m3u8 = json?.data?.url || json?.stream || json?.url
+      if (m3u8 && m3u8.includes('.m3u8')) return { m3u8, source: 'SmashyStream', referer: 'https://smashystream.com/' }
+    } catch {}
+  }
+  throw new Error('filmxy: no stream')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Master orchestrator
+// ─────────────────────────────────────────────────────────────────────────────
+const SOURCES = [
+  { fn: sourceVidsrcMe,   name: 'vidsrc.me'     },
+  { fn: sourceVidsrcXyz,  name: 'vidsrc.xyz'    },
+  { fn: sourceVidsrcIn,   name: 'vidsrc.in'     },
+  { fn: sourceVidlink,    name: 'vidlink.pro'   },
+  { fn: source2embed,     name: '2embed'        },
+  { fn: sourceSuperembed, name: 'superembed'    },
+  { fn: sourceMoviesApi,  name: 'moviesapi'     },
+  { fn: sourceRive,       name: 'embed.su'      },
+  { fn: sourceAutoembed,  name: 'autoembed'     },
+  { fn: sourceFilmxy,     name: 'smashystream'  },
+]
+
 app.get('/api/stream/:type/:id', async (req, res) => {
   const { type, id } = req.params
   const season  = parseInt(req.query.s || '1', 10)
@@ -518,34 +501,51 @@ app.get('/api/stream/:type/:id', async (req, res) => {
   }
 
   const baseHost = `${req.protocol}://${req.get('host')}`
+  const errors = []
 
-  // Try each method in order
-  const methods = [
-    () => extractVidsrcXyz(type, id, season, episode),
-    () => soaperGetStream(type, id, season, episode),
-    () => extractFallback(type, id, season, episode),
-  ]
-
-  for (const method of methods) {
+  for (const { fn, name } of SOURCES) {
     try {
-      const result = await method()
-      if (!result?.m3u8) continue
+      console.log(`[stream] Trying ${name} for ${type}/${id}`)
+      const result = await fn(type, id, season, episode)
 
-      // Wrap m3u8 through our proxy
+      if (!result?.m3u8 || !result.m3u8.includes('.m3u8')) {
+        console.warn(`[stream] ${name}: invalid m3u8`)
+        continue
+      }
+
+      // Validate the m3u8 is actually reachable
+      try {
+        const testR = await fetch(result.m3u8, {
+          method: 'HEAD',
+          headers: { 'User-Agent': UA, Referer: result.referer || '' },
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!testR.ok && testR.status !== 403) {  // 403 may still work with proper headers
+          console.warn(`[stream] ${name}: HEAD check failed (${testR.status})`)
+          // Don't skip — some servers block HEAD but allow GET
+        }
+      } catch {}
+
       const proxied = `${baseHost}/api/proxy?url=${encodeURIComponent(result.m3u8)}&ref=${encodeURIComponent(result.referer || '')}`
       const payload = { ok: true, m3u8: proxied, source: result.source, raw: result.m3u8 }
       setCache(cacheKey, payload)
+      console.log(`[stream] ✓ ${name}: ${result.m3u8.substring(0, 80)}`)
       return res.json(payload)
     } catch (e) {
-      console.warn(`[stream] Method failed: ${e.message}`)
+      console.warn(`[stream] ${name} failed: ${e.message}`)
+      errors.push(`${name}: ${e.message}`)
     }
   }
 
-  res.status(404).json({ ok: false, error: 'All extraction methods failed. The title may not be available on any source.' })
+  res.status(404).json({
+    ok: false,
+    error: `Stream not found after trying ${SOURCES.length} sources. This title may not be available yet.`,
+    details: errors,
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/proxy  —  CORS proxy for m3u8 manifests + .ts segments
+// /api/proxy — CORS proxy for HLS manifests + segments
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/proxy', async (req, res) => {
   const raw = req.query.url
@@ -554,28 +554,31 @@ app.get('/api/proxy', async (req, res) => {
   const target  = decodeURIComponent(raw)
   const referer = req.query.ref ? decodeURIComponent(req.query.ref) : ''
 
-  let origin
-  try { origin = new URL(target).origin } catch { origin = 'https://vidsrc.xyz' }
-
-  const headers = {
-    'User-Agent': UA,
-    Referer:      referer || origin + '/',
-    Origin:       origin,
-    Accept:       '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-  }
+  let origin = 'https://vidsrc.me'
+  try { origin = new URL(target).origin } catch {}
 
   let upstream
   try {
-    upstream = await fetch(target, { headers, signal: AbortSignal.timeout(20000) })
+    upstream = await fetch(target, {
+      headers: {
+        'User-Agent': UA,
+        Referer: referer || origin + '/',
+        Origin:  origin,
+        Accept:  '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'identity',
+      },
+      signal: AbortSignal.timeout(25000),
+    })
   } catch (e) {
     return res.status(502).send(`proxy fetch error: ${e.message}`)
   }
 
   if (!upstream.ok) return res.status(upstream.status).send(`upstream ${upstream.status}`)
 
-  const ct      = upstream.headers.get('content-type') || ''
-  const isM3u8  = ct.includes('mpegurl') || ct.includes('x-mpegURL') || target.includes('.m3u8')
+  const ct     = upstream.headers.get('content-type') || ''
+  const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegURL') || target.includes('.m3u8')
+  const isSub  = target.includes('.vtt') || target.includes('.srt')
 
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
@@ -583,15 +586,21 @@ app.get('/api/proxy', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
 
   if (isM3u8) {
-    const text    = await upstream.text()
-    const base    = target.substring(0, target.lastIndexOf('/') + 1)
+    const text = await upstream.text()
+    const base = target.substring(0, target.lastIndexOf('/') + 1)
     const proxyBase = `${req.protocol}://${req.get('host')}/api/proxy?ref=${encodeURIComponent(referer)}&url=`
     const rewritten = rewriteManifest(text, base, proxyBase)
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl')
     return res.send(rewritten)
   }
 
-  // Binary segment — stream through
+  if (isSub) {
+    const text = await upstream.text()
+    res.setHeader('Content-Type', ct || 'text/vtt')
+    return res.send(text)
+  }
+
+  // Binary segment
   const buf = Buffer.from(await upstream.arrayBuffer())
   res.setHeader('Content-Type', ct || 'video/mp2t')
   return res.send(buf)
@@ -605,20 +614,26 @@ function rewriteManifest(text, base, proxyBase) {
       return line.replace(/URI="([^"]+)"/g, (_, uri) =>
         `URI="${proxyBase}${encodeURIComponent(toAbs(uri, base))}"`)
     }
-    return proxyBase + encodeURIComponent(toAbs(t, base))
+    if (t.startsWith('http') || t.endsWith('.m3u8') || t.endsWith('.ts') || t.includes('.ts?') || t.includes('.m3u8?')) {
+      return proxyBase + encodeURIComponent(toAbs(t, base))
+    }
+    return line
   }).join('\n')
 }
 
 function toAbs(url, base) {
+  if (!url) return base
+  url = url.trim()
   if (url.startsWith('http')) return url
   if (url.startsWith('//'))   return 'https:' + url
   if (url.startsWith('/')) {
-    try { return new URL(base).origin + url } catch {}
+    try { return new URL(base).origin + url } catch { return base + url }
   }
   return base + url
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true, ts: Date.now() }))
+app.get('/health', (_, res) => res.json({ ok: true, ts: Date.now(), sources: SOURCES.map(s => s.name) }))
+app.options('*', (_, res) => { res.setHeader('Access-Control-Allow-Origin','*'); res.setHeader('Access-Control-Allow-Headers','*'); res.sendStatus(200) })
 
-app.listen(PORT, () => console.log(`apex-stream-api on :${PORT}`))
+app.listen(PORT, () => console.log(`apex-stream-api v3 on :${PORT} — ${SOURCES.length} sources ready`))
